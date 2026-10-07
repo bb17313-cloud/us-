@@ -576,6 +576,7 @@ def scan_us_market():
 
                 info = stock.info or {}
                 sector = info.get('sector', 'غير محدد')
+                industry = info.get('industry', 'غير محدد')
 
                 volume = info.get('volume') or info.get('regularMarketVolume')
                 if not volume:
@@ -658,45 +659,58 @@ def scan_us_market():
                     f"| إصدارات={len(issuance_lines)} | إجراءات={len(corp_action_lines)} | SEC={len(filings_display)}"
                 )
 
-                # ---- بناء البطاقة المختصرة بالعربية ----
+                # ---- بناء البطاقة المنظمة ----
                 extra_parts = []
 
                 if corp_action_lines:
                     extra_parts.append("\n".join(corp_action_lines))
 
                 if issuance_lines:
-                    extra_parts.append("📋 الإصدارات:\n" + "\n".join(issuance_lines[:2]))
+                    extra_parts.append("📋 <b>الإصدارات</b>\n" + "\n".join(issuance_lines[:2]))
 
+                # المحفزات (مترجمة + روابط)
                 cat_lines = []
                 if catalyst_lines:
-                    cat_lines.extend(catalyst_lines[:2])
+                    cat_lines.extend(catalyst_lines[:3])
                 if news_items:
                     for n in news_items[:2]:
                         cat_lines.append(
-                            f'• <a href="{n["url"]}">{html.escape(n["title"][:55])}</a> <code>{n["date"]}</code>'
+                            f'• <a href="{n["url"]}">{html.escape(n["title"][:60])}</a> <code>{n["date"]}</code>'
                         )
                 if cat_lines:
-                    extra_parts.append("⚡ المحفزات:\n" + "\n".join(cat_lines))
+                    extra_parts.append("⚡ <b>المحفزات</b>\n" + "\n".join(cat_lines))
                 else:
-                    extra_parts.append("⚡ لا محفزات حديثة")
+                    extra_parts.append("⚡ <b>المحفزات</b>\nلا توجد محفزات حديثة")
 
+                # آخر 4 إفصاحات SEC مهمة (مترجمة + روابط)
                 if filings_display:
-                    sec_lines = [format_filing_line(f) for f in filings_display]
-                    sec_lines.append(f'🔗 <a href="{sec_browse}">الإفصاحات</a> · <a href="{tv_url}">الرسم</a>')
-                    extra_parts.append("📄 الإفصاحات:\n" + "\n".join(sec_lines))
+                    sec_lines = [format_filing_line(f) for f in filings_display[:4]]
+                    extra_parts.append("📄 <b>إفصاحات SEC</b>\n" + "\n".join(sec_lines))
                 else:
-                    extra_parts.append(
-                        f'📄 لا إفصاحات · <a href="{sec_browse}">SEC</a> · <a href="{tv_url}">الرسم</a>'
-                    )
+                    extra_parts.append("📄 <b>إفصاحات SEC</b>\nلا توجد إفصاحات حديثة")
 
-                extra_text = ("\n" + "\n".join(extra_parts)) if extra_parts else ""
+                extra_parts.append(
+                    f'🔗 <a href="{sec_browse}">SEC</a> · <a href="{tv_url}">TradingView</a>'
+                )
+
+                extra_text = ("\n\n" + "\n\n".join(extra_parts)) if extra_parts else ""
 
                 msg = f"""{current_session} | {alert_line}
-🚨 <b>{html.escape(ticker)}</b> · {html.escape(str(sector)[:20])}
-💵 <code>${latest_price}</code> ({change_str}) · الحجم {vol_str}
-<code>القوة {rsi_4h} · اتجاه 4س {pt_4h_display} · 15د {pt_age_15m}
-قمة/قاع سنة {high_52w_str} / {low_52w_str}</code>{choch_line}
-🎯 <code>${target1}</code>←<code>${target_max}</code>  ⛔ <code>${stop_loss}</code>{extra_text}"""
+
+<b>الرمز:</b> {html.escape(ticker)}
+<b>القطاع:</b> {html.escape(str(sector))}
+<b>الصناعة:</b> {html.escape(str(industry))}
+<b>السعر الحالي:</b> <code>${latest_price}</code>
+<b>الحجم Vol:</b> <code>{vol_str}</code>
+<b>التغيير:</b> <code>{change_str}</code>
+<b>قمة 52 أسبوع:</b> <code>{high_52w_str}</code>
+<b>قاع 52 أسبوع:</b> <code>{low_52w_str}</code>
+<b>RSI:</b> <code>{rsi_4h}</code>
+<b>Power Trend 4H:</b> <code>{pt_4h_display}</code>
+<b>Power Trend 15M:</b> <code>{pt_age_15m} شمعة</code>{choch_line}
+
+🎯 <b>الأهداف:</b> <code>${target1}</code> ← <code>${target_max}</code>
+⛔ <b>وقف الخسارة:</b> <code>${stop_loss}</code>{extra_text}"""
 
                 send_telegram(msg)
                 print(f"✅ تم إرسال تنبيه للسهم {ticker} | الجلسة: {current_session} | سعر: ${latest_price}")
