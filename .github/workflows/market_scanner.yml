@@ -1,21 +1,17 @@
 # ============================================================
-# US Stock Scanner - يعمل كل 5 دقائق خلال جلسات السوق الأمريكية
-# الجلسات: Premarket (4:00) → Regular (9:30-16:00) → Postmarket (حتى 20:00) ET
-# يتوقف خارج هذه الساعات ويعود في يوم التداول التالي
-# يرتبط مع: main.py
+# US Stock Scanner - كل 5 دقائق خلال جلسات السوق الأمريكية
+# Premarket 04:00 → Postmarket 20:00 ET | يتوقف خارجها
 # ============================================================
 
 name: US Market Scanner
 
 on:
   schedule:
-    # كل 5 دقائق، من الاثنين إلى الجمعة (UTC)
-    # الفحص الفعلي لساعات السوق يتم داخل الـ job بتوقيت نيويورك
     - cron: '*/5 * * * 1-5'
-  workflow_dispatch: # تشغيل يدوي عند الحاجة
+  workflow_dispatch:
 
 permissions:
-  contents: write # لحفظ alerts_history.json في المستودع
+  contents: write
 
 jobs:
   scan:
@@ -23,14 +19,11 @@ jobs:
     timeout-minutes: 15
 
     steps:
-      # --------------------------------------------------
-      # 1) التحقق من ساعات السوق (America/New_York)
-      #    Premarket 04:00 → Postmarket 20:00
-      # --------------------------------------------------
       - name: Check US market hours (ET)
         id: market
         run: |
           python3 - <<'EOF'
+          import os
           from datetime import datetime, time
           try:
               from zoneinfo import ZoneInfo
@@ -39,53 +32,38 @@ jobs:
               ZoneInfo = lambda x: pytz.timezone(x)
 
           now = datetime.now(ZoneInfo("America/New_York"))
-          weekday = now.weekday()  # 0=Mon ... 6=Sun
+          weekday = now.weekday()
           t = now.time()
+          active = "false"
 
-          # عطلة نهاية الأسبوع
           if weekday >= 5:
               print(f"⏸️ Weekend ({now.strftime('%A %Y-%m-%d %H:%M %Z')}) — skipping")
-              print("::set-output name=active::false")
-              exit(0)
-
-          # من 4:00 صباحاً حتى 8:00 مساءً بتوقيت نيويورك
-          if time(4, 0) <= t <= time(20, 0):
+          elif time(4, 0) <= t <= time(20, 0):
               print(f"✅ Market hours active: {now.strftime('%A %Y-%m-%d %H:%M %Z')}")
-              print("::set-output name=active::true")
+              active = "true"
           else:
               print(f"⏸️ Outside market hours ({now.strftime('%H:%M %Z')}) — skipping")
-              print("::set-output name=active::false")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"active={active}\n")
           EOF
 
-      # --------------------------------------------------
-      # 2) Checkout الكود
-      # --------------------------------------------------
       - name: Checkout repository
         if: steps.market.outputs.active == 'true'
         uses: actions/checkout@v4
 
-      # --------------------------------------------------
-      # 3) إعداد Python
-      # --------------------------------------------------
       - name: Set up Python
         if: steps.market.outputs.active == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
 
-      # --------------------------------------------------
-      # 4) تثبيت المكتبات
-      # --------------------------------------------------
       - name: Install dependencies
         if: steps.market.outputs.active == 'true'
         run: |
           python -m pip install --upgrade pip
           pip install yfinance pandas numpy requests
 
-      # --------------------------------------------------
-      # 5) استعادة سجل التنبيهات (حتى لا يتكرر تنبيه بلا تغيّر)
-      # --------------------------------------------------
       - name: Restore alerts history
         if: steps.market.outputs.active == 'true'
         uses: actions/cache/restore@v4
@@ -95,9 +73,6 @@ jobs:
           restore-keys: |
             alerts-history-
 
-      # --------------------------------------------------
-      # 6) تشغيل الماسح (main.py)
-      # --------------------------------------------------
       - name: Run market scanner
         if: steps.market.outputs.active == 'true'
         env:
@@ -105,7 +80,6 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
         run: |
-          # يدعم main.py أو us_stock_scanner.py
           if [ -f main.py ]; then
             python main.py
           elif [ -f us_stock_scanner.py ]; then
@@ -115,9 +89,6 @@ jobs:
             exit 1
           fi
 
-      # --------------------------------------------------
-      # 7) حفظ سجل التنبيهات للتشغيل القادم
-      # --------------------------------------------------
       - name: Save alerts history
         if: steps.market.outputs.active == 'true' && always()
         uses: actions/cache/save@v4
