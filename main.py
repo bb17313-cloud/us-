@@ -1,6 +1,7 @@
 import os
 import json
 import html
+import time as time_mod
 import requests
 import pandas as pd
 import numpy as np
@@ -14,7 +15,11 @@ BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 # هوية الطلبات لموقع SEC (مطلوبة منهم) - يفضل وضع بريدك في Secret باسم SEC_USER_AGENT
-SEC_HEADERS = {"User-Agent": os.environ.get("SEC_USER_AGENT", "USStockScanner contact@example.com")}
+SEC_HEADERS = {
+    "User-Agent": os.environ.get("SEC_USER_AGENT", "USStockScanner/1.0 (contact@example.com)"),
+    "Accept-Encoding": "gzip, deflate",
+    "Accept": "application/json",
+}
 
 # اسم ملف التخزين الدائم لسجل التنبيهات
 HISTORY_FILE = "alerts_history.json"
@@ -58,7 +63,6 @@ SEC_FORMS_AR = {
     "13F-HR": "حيازات مؤسساتية",
 }
 
-# نماذج الإصدارات / الطرح
 ISSUANCE_FORMS = {"S-1", "S-3", "424B5", "424B3", "424B4", "F-1", "F-3"}
 
 SEC_8K_ITEMS_AR = {
@@ -77,7 +81,6 @@ SEC_8K_ITEMS_AR = {
 _cik_map = None
 
 def load_alert_history():
-    """تحميل سجل التنبيهات السابقة من ملف JSON"""
     if os.path.exists(HISTORY_FILE):
         try:
             with open(HISTORY_FILE, "r", encoding="utf-8") as f:
@@ -88,7 +91,6 @@ def load_alert_history():
     return {}
 
 def save_alert_history(history):
-    """حفظ سجل التنبيهات المحدث في ملف JSON"""
     try:
         with open(HISTORY_FILE, "w", encoding="utf-8") as f:
             json.dump(history, f, ensure_ascii=False, indent=4)
@@ -96,7 +98,6 @@ def save_alert_history(history):
         print(f"⚠️ خطأ في حفظ ملف الذاكرة: {e}")
 
 def calculate_rsi(series, period=14):
-    """حساب RSI بتنعيم وايلدر (Wilder's Smoothing) لمطابقة المنصات"""
     delta = series.diff()
     gain = delta.where(delta > 0, 0)
     loss = -delta.where(delta < 0, 0)
@@ -106,16 +107,12 @@ def calculate_rsi(series, period=14):
     return 100 - (100 / (1 + rs))
 
 def calculate_power_trend_age(df, min_candles=20):
-    """حساب عمر Power Trend (EMA20 > SMA50 و Close > EMA20 و RSI > 50)"""
     if len(df) < min_candles:
         return 0
-
     ema20 = df['Close'].ewm(span=20, adjust=False).mean()
     sma50 = df['Close'].rolling(window=50).mean()
     rsi = calculate_rsi(df['Close'], period=14)
-
     is_power_trend = (df['Close'] > ema20) & (ema20 > sma50) & (rsi > 50)
-
     age = 0
     for flag in reversed(is_power_trend.values):
         if flag:
@@ -125,7 +122,6 @@ def calculate_power_trend_age(df, min_candles=20):
     return age
 
 def check_choch_change(df_15m):
-    """التحقق من حصول CHOCH (تغير هيكل السوق إلى صاعد)"""
     if len(df_15m) < 20:
         return False
     recent_structure_high = df_15m['High'].iloc[-15:-2].max()
@@ -133,26 +129,23 @@ def check_choch_change(df_15m):
     return latest_close > recent_structure_high
 
 def get_current_session(last_timestamp):
-    """تحديد الجلسة اللحظية (Premarket / Regular Market / Postmarket)"""
     try:
         if last_timestamp.tzinfo is None:
             ny_time = last_timestamp.tz_localize('UTC').tz_convert('America/New_York').time()
         else:
             ny_time = last_timestamp.tz_convert('America/New_York').time()
-
         if time(4, 0) <= ny_time < time(9, 30):
-            return "🌅 Premarket"
+            return "🌅 ما قبل الافتتاح"
         elif time(9, 30) <= ny_time < time(16, 0):
-            return "🔔 Regular Market"
+            return "🔔 الجلسة الرسمية"
         elif time(16, 0) <= ny_time <= time(20, 0):
-            return "🌙 Postmarket"
+            return "🌙 ما بعد الإغلاق"
         else:
-            return "💤 Extended"
+            return "💤 خارج الجلسة"
     except Exception:
-        return "🌐 Extended"
+        return "🌐 خارج الجلسة"
 
 def format_volume(vol):
-    """تنسيق الحجم بشكل مختصر (M / K)"""
     if vol is None or (isinstance(vol, float) and np.isnan(vol)):
         return "N/A"
     try:
@@ -166,10 +159,9 @@ def format_volume(vol):
         return "N/A"
 
 # ---------------------------------------------------------------
-# إفصاحات SEC الحقيقية (من EDGAR الرسمي)
+# إفصاحات SEC
 # ---------------------------------------------------------------
 def get_cik(ticker):
-    """جلب رقم CIK للسهم من ملف SEC الرسمي (يُحمّل مرة واحدة)"""
     global _cik_map
     if _cik_map is None:
         _cik_map = {}
@@ -184,67 +176,77 @@ def get_cik(ticker):
     return _cik_map.get(ticker.upper().replace("-", "."))
 
 def get_sec_filings(ticker, days=90, limit=30):
-    """جلب آخر الإفصاحات المهمة من SEC EDGAR مع رابط كل إفصاح"""
     cik = get_cik(ticker)
     if not cik:
+        print(f"⚠️ لا يوجد CIK لـ {ticker}")
         return []
     try:
-        r = requests.get(f"https://data.sec.gov/submissions/CIK{cik}.json",
-                         headers=SEC_HEADERS, timeout=15)
+        time_mod.sleep(0.3)
+        r = requests.get(
+            f"https://data.sec.gov/submissions/CIK{cik}.json",
+            headers=SEC_HEADERS, timeout=20,
+        )
         r.raise_for_status()
-        recent = r.json()["filings"]["recent"]
+        data = r.json()
+        recent = data.get("filings", {}).get("recent", {})
+        if not recent or "form" not in recent:
+            print(f"⚠️ لا توجد إفصاحات حديثة لـ {ticker}")
+            return []
     except Exception as e:
         print(f"⚠️ تعذر جلب إفصاحات {ticker}: {e}")
         return []
 
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
     cik_int = str(int(cik))
+    forms_list = recent.get("form", [])
+    dates_list = recent.get("filingDate", [])
+    acc_list = recent.get("accessionNumber", [])
+    doc_list = recent.get("primaryDocument", [])
+    items_list = recent.get("items", [""] * len(forms_list))
+
     filings = []
-    for i in range(len(recent["form"])):
-        form = recent["form"][i]
-        date = recent["filingDate"][i]
+    for i in range(len(forms_list)):
+        form = forms_list[i].strip()
+        date = dates_list[i]
         if date < cutoff:
             break
         if form not in SEC_FORMS_AR:
             continue
-        acc = recent["accessionNumber"][i].replace("-", "")
-        doc = recent["primaryDocument"][i]
-        items_raw = recent["items"][i] if "items" in recent else ""
+        acc = acc_list[i].replace("-", "")
+        doc = doc_list[i] if i < len(doc_list) else ""
+        items_raw = items_list[i] if i < len(items_list) else ""
         filings.append({
             "form": form,
             "date": date,
-            "items": [x.strip() for x in items_raw.split(",") if x.strip()],
+            "items": [x.strip() for x in str(items_raw).split(",") if x.strip()],
             "url": f"https://www.sec.gov/Archives/edgar/data/{cik_int}/{acc}/{doc}",
-            "accession": recent["accessionNumber"][i],
+            "accession": acc_list[i],
         })
         if len(filings) >= limit:
             break
+    print(f"📄 {ticker}: SEC filings = {len(filings)}")
     return filings
 
 def format_filing_line(f):
-    """سطر إفصاح واحد مختصر مع الرابط القابل للفتح"""
     form = f["form"]
     label = SEC_FORMS_AR.get(form, form)
-
     if form == "8-K":
         names = [SEC_8K_ITEMS_AR[i] for i in f["items"] if i in SEC_8K_ITEMS_AR]
         if names:
-            label = " / ".join(names[:2])
+            label = "/".join(names[:2])
     elif form in ("4", "4/A"):
-        label = "شراء أسهم من قبل مطّلع (Insider Purchase)"
+        label = "شراء مطّلع"
     elif form in ISSUANCE_FORMS:
-        label = "طرح / إصدار"
-
+        label = "طرح"
     return (
         f'• <a href="{f["url"]}">{html.escape(form)}</a> '
-        f'<code>({f["date"]})</code>: {html.escape(label)}'
+        f'<code>{f["date"]}</code> {html.escape(label)}'
     )
 
 # ---------------------------------------------------------------
-# الإصدارات · المحفزات · Reverse Split / Dividends
+# الإصدارات · المحفزات · تجزئة عكسية / توزيعات
 # ---------------------------------------------------------------
 def get_issuance_lines(filings, limit=3):
-    """استخراج الإصدارات/الطروحات من نماذج SEC مع رابط المصدر"""
     lines = []
     seen = set()
     for f in filings:
@@ -252,109 +254,98 @@ def get_issuance_lines(filings, limit=3):
         key = (form, f["date"])
         if key in seen:
             continue
-
         if form in ISSUANCE_FORMS:
             seen.add(key)
             lines.append(
-                f'📋 <a href="{f["url"]}">{html.escape(form)}</a> '
-                f'طرح/إصدار <code>({f["date"]})</code>'
+                f'• <a href="{f["url"]}">{html.escape(form)}</a> '
+                f'طرح/إصدار <code>{f["date"]}</code>'
             )
         elif form == "8-K" and "3.02" in f["items"]:
             seen.add(key)
             lines.append(
-                f'📋 <a href="{f["url"]}">8-K</a> '
-                f'بيع أسهم غير مسجل <code>({f["date"]})</code>'
+                f'• <a href="{f["url"]}">8-K</a> '
+                f'بيع أسهم غير مسجل <code>{f["date"]}</code>'
             )
-
         if len(lines) >= limit:
             break
-
     if not lines:
         for f in filings:
             if f["form"] == "6-K":
                 lines.append(
-                    f'📋 <a href="{f["url"]}">6-K</a> '
-                    f'تقرير أجنبي / إصدار <code>({f["date"]})</code>'
+                    f'• <a href="{f["url"]}">6-K</a> '
+                    f'تقرير أجنبي <code>{f["date"]}</code>'
                 )
                 break
     return lines
 
 
 def get_corporate_action_lines(stock, filings, news_items):
-    """استخراج Reverse Split و Dividends من الإفصاحات والأخبار وبيانات yfinance"""
     lines = []
     found_split = False
     found_div = False
 
-    # --- Reverse Split من الإفصاحات ---
     for f in filings:
         if found_split:
             break
-        if f["form"] == "8-K" and any(i in ("3.03", "5.03", "8.01") for i in f["items"]):
+        if f["form"] == "8-K" and any(i in ("3.03", "5.03") for i in f["items"]):
             lines.append(
-                f'📉 <b>Reverse Split</b>: معلن بإفصاح '
-                f'<a href="{f["url"]}">8-K</a> '
-                f'بتاريخ <code>{f["date"]}</code>'
+                f'📉 تجزئة عكسية: <a href="{f["url"]}">8-K</a> <code>{f["date"]}</code>'
             )
             found_split = True
 
-    # --- Reverse Split من الأخبار ---
     if not found_split:
         for n in news_items:
             t = n["title"].lower()
             if "reverse split" in t or "reverse stock split" in t:
                 lines.append(
-                    f'📉 <b>Reverse Split</b>: '
-                    f'<a href="{n["url"]}">{html.escape(n["title"][:70])}</a> '
+                    f'📉 تجزئة عكسية: '
+                    f'<a href="{n["url"]}">{html.escape(n["title"][:55])}</a> '
                     f'<code>{n["date"]}</code>'
                 )
                 found_split = True
                 break
 
-    # --- Dividends من yfinance (الأدق) ---
     try:
         info = stock.info or {}
         div_rate = info.get("dividendRate") or info.get("trailingAnnualDividendRate")
         div_yield = info.get("dividendYield")
         ex_div = info.get("exDividendDate")
 
-        if div_rate and div_rate > 0:
+        if div_rate and float(div_rate) > 0:
             yield_str = ""
-            if div_yield:
-                y = div_yield * 100 if div_yield < 1 else div_yield
-                yield_str = f" | العائد: <code>{y:.2f}%</code>"
-
+            if div_yield is not None:
+                y = float(div_yield)
+                if y < 0.15:
+                    y = y * 100
+                if 0 < y <= 20:
+                    yield_str = f" | {y:.2f}%"
             date_str = ""
             if ex_div:
                 try:
                     if isinstance(ex_div, (int, float)):
-                        d = datetime.fromtimestamp(ex_div, tz=timezone.utc).strftime("%Y-%m-%d")
+                        d = datetime.fromtimestamp(int(ex_div), tz=timezone.utc).strftime("%Y-%m-%d")
                     else:
                         d = str(ex_div)[:10]
-                    date_str = f" | Ex-Date: <code>{d}</code>"
+                    date_str = f" | <code>{d}</code>"
                 except Exception:
                     pass
-
             lines.append(
-                f'💰 <b>Dividend</b>: <code>${div_rate:.4f}</code>'
-                f'{yield_str}{date_str}'
+                f'💰 توزيعات <code>${float(div_rate):.2f}</code>{yield_str}{date_str}'
             )
             found_div = True
     except Exception:
         pass
 
-    # --- Dividends من الأخبار إن لم نجد من yfinance ---
     if not found_div:
         for n in news_items:
             t = n["title"].lower()
-            if any(k in t for k in ("dividend", "div ", "special dividend", "cash dividend")):
+            if any(k in t for k in ("dividend", "special dividend", "cash dividend")):
                 lines.append(
-                    f'💰 <b>Dividend</b>: '
-                    f'<a href="{n["url"]}">{html.escape(n["title"][:70])}</a> '
+                    f'💰 توزيعات: '
+                    f'<a href="{n["url"]}">{html.escape(n["title"][:55])}</a> '
                     f'<code>{n["date"]}</code>'
                 )
                 break
-
     return lines
 
 
@@ -366,11 +357,12 @@ CATALYST_ITEMS_AR = {
     "2.03": "التزام مالي جديد",
 }
 
+NEWS_DAYS = 90
+NEWS_SHOW = 3
+
 def get_catalyst_lines(stock, filings):
-    """محفزات مؤكدة فقط من SEC خلال 90 يوماً + موعد نتائج قادم مسجل"""
     lines = []
     today = datetime.now(timezone.utc).date()
-
     done = set()
     for f in filings:
         if f["form"] != "8-K":
@@ -379,8 +371,8 @@ def get_catalyst_lines(stock, filings):
             if it in CATALYST_ITEMS_AR and it not in done:
                 done.add(it)
                 lines.append(
-                    f'⚡ <a href="{f["url"]}">8-K</a> '
-                    f'{CATALYST_ITEMS_AR[it]} <code>({f["date"]})</code>'
+                    f'• <a href="{f["url"]}">8-K</a> '
+                    f'{CATALYST_ITEMS_AR[it]} <code>{f["date"]}</code>'
                 )
     lines = lines[:3]
 
@@ -390,7 +382,7 @@ def get_catalyst_lines(stock, filings):
         for d in (dates or []):
             d = d.date() if hasattr(d, "date") else d
             if 0 <= (d - today).days <= NEWS_DAYS:
-                lines.append(f"📅 موعد النتائج القادم: <code>{d}</code>")
+                lines.append(f"📅 موعد النتائج: <code>{d}</code>")
                 break
     except Exception:
         pass
@@ -401,13 +393,13 @@ def get_catalyst_lines(stock, filings):
             if ts:
                 d = datetime.fromtimestamp(ts, tz=timezone.utc).date()
                 if 0 <= (d - today).days <= NEWS_DAYS:
-                    lines.append(f"📅 موعد النتائج القادم: <code>{d}</code>")
+                    lines.append(f"📅 موعد النتائج: <code>{d}</code>")
         except Exception:
             pass
     return lines
 
 # ---------------------------------------------------------------
-# الأخبار الحقيقية
+# الأخبار
 # ---------------------------------------------------------------
 def _news_from_yfinance(stock, days=7, limit=2):
     out = []
@@ -466,9 +458,6 @@ def _news_from_rss(ticker, days=7, limit=2):
         print(f"⚠️ RSS news خطأ لـ {ticker}: {e}")
     return out
 
-NEWS_DAYS = 90
-NEWS_SHOW = 3
-
 IMPORTANT_KEYWORDS = [
     "earnings", "revenue", "guidance", "outlook", "forecast", "fda", "approval", "approves",
     "approved", "clearance", "contract", "award", "awarded", "order", "deal", "acquisition",
@@ -485,13 +474,25 @@ def news_importance(title):
 def get_recent_news(stock, ticker, days=NEWS_DAYS, limit=NEWS_SHOW):
     pool = _news_from_yfinance(stock, days, 40) + _news_from_rss(ticker, days, 40)
     seen, unique = set(), []
+    ticker_l = ticker.lower()
+    company = ""
+    try:
+        company = ((stock.info or {}).get("shortName") or "").lower()
+        company = company.split(",")[0].split(" ")[0] if company else ""
+    except Exception:
+        pass
+
     for n in pool:
         key = n["title"].strip().lower()
         if n["url"] in seen or key in seen:
             continue
+        if ticker_l not in key and (not company or company not in key):
+            if n.get("source") != "Yahoo Finance":
+                continue
         seen.add(n["url"]); seen.add(key)
         n["score"] = news_importance(n["title"])
         unique.append(n)
+
     important = [n for n in unique if n["score"] > 0]
     important.sort(key=lambda n: (n["score"], n["date"]), reverse=True)
     top = important[:limit]
@@ -562,14 +563,19 @@ def scan_us_market():
             has_fvg = current_low >= (prev_high * 0.997)
 
             if has_fvg:
+                # لا تكرار إذا لم يتغير السعر (≥ 0.1%)
+                if ticker in alert_history:
+                    prev_price = alert_history[ticker].get('last_price', 0)
+                    if prev_price and abs(latest_price - prev_price) / prev_price < 0.001:
+                        continue
+
                 found_opportunities += 1
 
                 has_choch = check_choch_change(df_15m)
-                choch_line = "\n⚡ CHOCH: اختراق هيكلي صاعد" if has_choch else ""
+                choch_line = "\n⚡ اختراق هيكلي صاعد (CHOCH)" if has_choch else ""
 
                 info = stock.info or {}
                 sector = info.get('sector', 'غير محدد')
-                industry = info.get('industry', 'غير محدد')
 
                 volume = info.get('volume') or info.get('regularMarketVolume')
                 if not volume:
@@ -641,7 +647,7 @@ def scan_us_market():
                 )
 
                 all_filings = get_sec_filings(ticker, limit=40)
-                filings_display = all_filings[:5]
+                filings_display = all_filings[:4]
                 catalyst_lines = get_catalyst_lines(stock, all_filings)
                 news_items = get_recent_news(stock, ticker)
                 issuance_lines = get_issuance_lines(all_filings)
@@ -652,61 +658,45 @@ def scan_us_market():
                     f"| إصدارات={len(issuance_lines)} | إجراءات={len(corp_action_lines)} | SEC={len(filings_display)}"
                 )
 
+                # ---- بناء البطاقة المختصرة بالعربية ----
                 extra_parts = []
 
                 if corp_action_lines:
                     extra_parts.append("\n".join(corp_action_lines))
 
                 if issuance_lines:
-                    block = ["📋 <b>الإصدارات</b>"]
-                    block.extend(issuance_lines)
-                    extra_parts.append("\n".join(block))
+                    extra_parts.append("📋 الإصدارات:\n" + "\n".join(issuance_lines[:2]))
 
-                cat_block = ["⚡ <b>المحفزات</b>"]
+                cat_lines = []
                 if catalyst_lines:
-                    cat_block.extend(catalyst_lines)
-                else:
-                    cat_block.append("لا توجد محفزات رُصدت مؤخراً")
+                    cat_lines.extend(catalyst_lines[:2])
                 if news_items:
-                    for n in news_items:
-                        src = f" · {html.escape(n['source'])}" if n['source'] else ""
-                        cat_block.append(
-                            f'• <a href="{n["url"]}">{html.escape(n["title"][:80])}</a> '
-                            f'<code>{n["date"]}</code>{src}'
+                    for n in news_items[:2]:
+                        cat_lines.append(
+                            f'• <a href="{n["url"]}">{html.escape(n["title"][:55])}</a> <code>{n["date"]}</code>'
                         )
-                extra_parts.append("\n".join(cat_block))
+                if cat_lines:
+                    extra_parts.append("⚡ المحفزات:\n" + "\n".join(cat_lines))
+                else:
+                    extra_parts.append("⚡ لا محفزات حديثة")
 
                 if filings_display:
-                    block = ["📄 <b>إفصاحات SEC</b>"]
-                    block.extend(format_filing_line(f) for f in filings_display)
-                    block.append(
-                        f'🔗 <a href="{sec_browse}">SEC</a> | '
-                        f'<a href="{tv_url}">TradingView</a>'
-                    )
-                    extra_parts.append("\n".join(block))
+                    sec_lines = [format_filing_line(f) for f in filings_display]
+                    sec_lines.append(f'🔗 <a href="{sec_browse}">الإفصاحات</a> · <a href="{tv_url}">الرسم</a>')
+                    extra_parts.append("📄 الإفصاحات:\n" + "\n".join(sec_lines))
                 else:
                     extra_parts.append(
-                        f'🔗 <a href="{sec_browse}">SEC</a> | '
-                        f'<a href="{tv_url}">TradingView</a>'
+                        f'📄 لا إفصاحات · <a href="{sec_browse}">SEC</a> · <a href="{tv_url}">الرسم</a>'
                     )
 
-                extra_text = ("\n\n" + "\n\n".join(extra_parts)) if extra_parts else ""
+                extra_text = ("\n" + "\n".join(extra_parts)) if extra_parts else ""
 
                 msg = f"""{current_session} | {alert_line}
-
-🚨 <b>Alert | {html.escape(ticker)} | United States</b>
-🏷 القطاع: {html.escape(str(sector))} | الصناعة: {html.escape(str(industry))}
-💵 السعر: <code>${latest_price}</code> | التغير: <code>{change_str}</code> | Vol: <code>{vol_str}</code>
-
-📊 <b>المؤشرات</b>
-<code>RSI 4H : {rsi_4h} 🟢
-PT 4H  : {pt_4h_display}
-PT 15M : {pt_age_15m} شمعة ⚡
-52W Hi : {high_52w_str}
-52W Lo : {low_52w_str}</code>{choch_line}
-
-🎯 <b>الأهداف</b>  <code>${target1}</code> ← <code>${target_max}</code>
-⛔ <b>وقف الخسارة</b>  <code>${stop_loss}</code>{extra_text}"""
+🚨 <b>{html.escape(ticker)}</b> · {html.escape(str(sector)[:20])}
+💵 <code>${latest_price}</code> ({change_str}) · الحجم {vol_str}
+<code>القوة {rsi_4h} · اتجاه 4س {pt_4h_display} · 15د {pt_age_15m}
+قمة/قاع سنة {high_52w_str} / {low_52w_str}</code>{choch_line}
+🎯 <code>${target1}</code>←<code>${target_max}</code>  ⛔ <code>${stop_loss}</code>{extra_text}"""
 
                 send_telegram(msg)
                 print(f"✅ تم إرسال تنبيه للسهم {ticker} | الجلسة: {current_session} | سعر: ${latest_price}")
