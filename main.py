@@ -9,6 +9,7 @@ import yfinance as yf
 from datetime import time, datetime, timedelta, timezone
 import xml.etree.ElementTree as ET
 from email.utils import parsedate_to_datetime
+import re
 
 # جلب بيانات الاعتماد من GitHub Secrets أو بيئة العمل
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -157,6 +158,190 @@ def format_volume(vol):
         return str(int(vol))
     except Exception:
         return "N/A"
+
+# ---------------------------------------------------------------
+# نقاط القوة والمخاطر (موجز عام لكل الأسهم بدون تمييز)
+# ---------------------------------------------------------------
+def get_strengths_risks(stock, ticker):
+    """
+    يبني ملخصًا موجزًا لنقاط القوة والمخاطر لأي سهم.
+    يعتمد على البيانات المالية + ملخص النشاط + مؤشرات النمو والمشاريع المستقبلية.
+    لا يوجد أي تمييز أو نقاط ثابتة لرمز معين.
+    """
+    info = stock.info or {}
+    strengths = []
+    risks = []
+
+    # ---- بيانات أساسية ----
+    market_cap = info.get("marketCap")
+    total_cash = info.get("totalCash")
+    total_debt = info.get("totalDebt")
+    revenue = info.get("totalRevenue") or info.get("revenue")
+    beta = info.get("beta")
+    trailing_pe = info.get("trailingPE")
+    forward_pe = info.get("forwardPE")
+    profit_margins = info.get("profitMargins")
+    free_cashflow = info.get("freeCashflow")
+    short_ratio = info.get("shortRatio")
+    revenue_growth = info.get("revenueGrowth")
+    earnings_growth = info.get("earningsGrowth")
+    recommendation = (info.get("recommendationKey") or "").lower()
+    target_mean = info.get("targetMeanPrice")
+    current_price = info.get("currentPrice") or info.get("regularMarketPrice")
+    sector = (info.get("sector") or "").strip()
+    industry = (info.get("industry") or "").strip()
+    summary = (info.get("longBusinessSummary") or info.get("longName") or "").lower()
+
+    # ---- 1. السيولة والقيمة السوقية ----
+    if market_cap:
+        if market_cap >= 10_000_000_000:
+            strengths.append(f"🏦 قيمة سوقية كبيرة ~{market_cap/1e9:.1f}$ مليار")
+        elif market_cap >= 1_000_000_000:
+            strengths.append(f"🏦 قيمة سوقية ~{market_cap/1e9:.1f}$ مليار")
+        elif market_cap >= 300_000_000:
+            strengths.append(f"🏦 قيمة سوقية متوسطة ~{market_cap/1e6:.0f}$ مليون")
+
+    if total_cash and total_cash >= 50_000_000:
+        cash_str = f"{total_cash/1e6:.0f}$ مليون" if total_cash < 1e9 else f"{total_cash/1e9:.1f}$ مليار"
+        strengths.append(f"💰 نقدية قوية ~{cash_str}")
+
+    # ---- 2. الديون ----
+    if total_debt is not None:
+        if total_debt < 5_000_000:
+            strengths.append("✅ بدون ديون تُذكر")
+        elif total_cash and total_cash > total_debt * 1.2:
+            strengths.append("✅ نقدية تفوق الديون")
+        elif total_debt > 0 and (not total_cash or total_debt > total_cash * 2):
+            risks.append(f"📉 ديون مرتفعة نسبيًا")
+
+    # ---- 3. الإيرادات والنمو ----
+    if revenue and revenue > 0:
+        if revenue_growth is not None:
+            if revenue_growth > 0.25:
+                strengths.append(f"📈 نمو إيرادات قوي (+{revenue_growth*100:.0f}%)")
+            elif revenue_growth > 0.10:
+                strengths.append(f"📈 نمو إيرادات إيجابي (+{revenue_growth*100:.0f}%)")
+            elif revenue_growth < -0.10:
+                risks.append(f"📉 تراجع في الإيرادات ({revenue_growth*100:.0f}%)")
+        if profit_margins is not None:
+            if profit_margins > 0.15:
+                strengths.append(f"✅ هوامش ربح قوية ({profit_margins*100:.0f}%)")
+            elif profit_margins < 0:
+                risks.append("🔥 خسائر تشغيلية")
+    else:
+        risks.append("📉 إيرادات محدودة أو غير موجودة بعد")
+
+    if earnings_growth is not None and earnings_growth > 0.20:
+        strengths.append(f"📊 نمو أرباح ملحوظ (+{earnings_growth*100:.0f}%)")
+
+    # ---- 4. التقييم ----
+    pe = trailing_pe or forward_pe
+    if pe:
+        if pe > 100:
+            risks.append("📈 تقييم مرتفع جدًا مقارنة بالإيرادات")
+        elif pe > 50:
+            risks.append("📈 تقييم مرتفع")
+        elif 0 < pe < 20:
+            strengths.append("✅ تقييم جذاب نسبيًا")
+
+    # ---- 5. التذبذب والشورت ----
+    if beta is not None:
+        if beta > 2.0:
+            risks.append("🎢 تذبذب شديد")
+        elif beta > 1.5:
+            risks.append("🎢 تذبذب مرتفع")
+        elif beta < 0.8:
+            strengths.append("🛡️ تذبذب منخفض نسبيًا")
+
+    if short_ratio and short_ratio > 10:
+        risks.append(f"🩳 نسبة شورت مرتفعة ({short_ratio:.1f})")
+
+    # ---- 6. التدفق النقدي ----
+    if free_cashflow is not None:
+        if free_cashflow > 50_000_000:
+            strengths.append("💵 تدفق نقدي حر إيجابي قوي")
+        elif free_cashflow < -20_000_000:
+            risks.append("🔥 حرق نقدي (تدفق حر سلبي)")
+
+    # ---- 7. توصيات المحللين والهدف السعري ----
+    if recommendation in ("buy", "strong_buy"):
+        strengths.append("👍 توصيات محللين إيجابية")
+    elif recommendation in ("sell", "strong_sell"):
+        risks.append("👎 توصيات محللين سلبية")
+
+    if target_mean and current_price and current_price > 0:
+        upside = ((target_mean - current_price) / current_price) * 100
+        if upside > 30:
+            strengths.append(f"🎯 هدف سعري أعلى بكثير (+{upside:.0f}%)")
+        elif upside < -15:
+            risks.append(f"🎯 هدف سعري أقل من السعر الحالي")
+
+    # ---- 8. مشاريع مستقبلية / محركات نمو من ملخص النشاط ----
+    future_keywords = [
+        "project", "pipeline", "development", "expand", "expansion", "contract",
+        "partnership", "agreement", "launch", "commercial", "deployment",
+        "construction", "build", "facility", "plant", "reactor", "satellite",
+        "mission", "trial", "phase", "approval", "fda", "nrc", "backlog",
+        "order", "award", "deal", "acquisition", "merge", "growth", "scale"
+    ]
+    risk_keywords = [
+        "risk", "uncertainty", "delay", "lawsuit", "litigation", "investigation",
+        "loss", "deficit", "dilution", "offering", "going concern", "bankruptcy",
+        "competition", "regulatory", "volatile", "dependence", "single"
+    ]
+
+    found_future = []
+    for kw in future_keywords:
+        if kw in summary:
+            found_future.append(kw)
+
+    if found_future:
+        # صياغة موجزة حسب الكلمات الموجودة
+        if any(k in found_future for k in ("project", "pipeline", "development", "construction", "facility", "plant", "reactor")):
+            strengths.append("🚀 مشاريع تطوير/إنشاء قيد التنفيذ")
+        if any(k in found_future for k in ("contract", "partnership", "agreement", "deal", "award", "order", "backlog")):
+            strengths.append("📝 عقود أو شراكات استراتيجية")
+        if any(k in found_future for k in ("launch", "commercial", "deployment", "mission")):
+            strengths.append("📡 خطط إطلاق/نشر تجاري")
+        if any(k in found_future for k in ("trial", "phase", "approval", "fda", "nrc")):
+            strengths.append("🧪 مراحل تجارب أو موافقات تنظيمية")
+        if any(k in found_future for k in ("expand", "expansion", "scale", "growth")):
+            strengths.append("📈 خطط توسع ونمو مستقبلي")
+
+    found_risks_txt = [kw for kw in risk_keywords if kw in summary]
+    if found_risks_txt:
+        if any(k in found_risks_txt for k in ("lawsuit", "litigation", "investigation")):
+            risks.append("⚖️ مخاطر قانونية أو تحقيقات")
+        if any(k in found_risks_txt for k in ("delay", "uncertainty", "regulatory")):
+            risks.append("⏳ تأخيرات أو عدم يقين تنظيمي")
+        if "dilution" in found_risks_txt or "offering" in found_risks_txt:
+            risks.append("📉 مخاطر تخفيف ملكية (إصدارات)")
+        if "competition" in found_risks_txt:
+            risks.append("⚔️ منافسة شديدة في القطاع")
+
+    # ---- 9. إشارات من القطاع/الصناعة (عامة بدون تمييز رموز) ----
+    sector_l = sector.lower()
+    industry_l = industry.lower()
+    if any(k in industry_l or k in sector_l for k in ("nuclear", "uranium", "energy")):
+        strengths.append("⚡ قطاع مدعوم بالطلب المتزايد على الطاقة")
+    if any(k in industry_l for k in ("semiconductor", "software", "artificial intelligence", "quantum", "cybersecurity")):
+        strengths.append("💻 قطاع تقني ذو إمكانات نمو عالية")
+    if any(k in industry_l for k in ("biotechnology", "pharmaceutical", "drug")):
+        strengths.append("🧬 قطاع دوائي/حيوي ذو محفزات تنظيمية")
+    if any(k in industry_l for k in ("aerospace", "defense", "satellite", "space")):
+        strengths.append("🛰️ قطاع فضاء/دفاع استراتيجي")
+    if any(k in industry_l for k in ("renewable", "solar", "battery", "electric vehicle")):
+        strengths.append("🌱 قطاع طاقة نظيفة مدعوم بالتحول العالمي")
+
+    # ---- ضمان وجود نقاط ----
+    if not strengths:
+        strengths.append("📊 بيانات أساسية متاحة للتحليل الفني والأساسي")
+    if not risks:
+        risks.append("⚠️ مخاطر السوق العامة والتذبذب الطبيعي")
+
+    # الحد الأقصى للنقاط (موجز)
+    return strengths[:5], risks[:4]
+
 
 # ---------------------------------------------------------------
 # إفصاحات SEC
@@ -654,6 +839,11 @@ def scan_us_market():
                 issuance_lines = get_issuance_lines(all_filings)
                 corp_action_lines = get_corporate_action_lines(stock, all_filings, news_items)
 
+                # ---- نقاط القوة والمخاطر (عامة لكل سهم) ----
+                strengths, risks = get_strengths_risks(stock, ticker)
+                strength_lines = "\n".join(f"• {s}" for s in strengths)
+                risk_lines = "\n".join(f"• {r}" for r in risks)
+
                 print(
                     f"ℹ️ {ticker}: أخبار={len(news_items)} | محفزات={len(catalyst_lines)} "
                     f"| إصدارات={len(issuance_lines)} | إجراءات={len(corp_action_lines)} | SEC={len(filings_display)}"
@@ -661,6 +851,12 @@ def scan_us_market():
 
                 # ---- بناء البطاقة المنظمة ----
                 extra_parts = []
+
+                # نقاط القوة والمخاطر
+                extra_parts.append(
+                    f"💪 <b>نقاط القوة</b>\n{strength_lines}\n\n"
+                    f"⚠️ <b>المخاطر</b>\n{risk_lines}"
+                )
 
                 if corp_action_lines:
                     extra_parts.append("\n".join(corp_action_lines))
