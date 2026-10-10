@@ -684,6 +684,194 @@ def get_recent_news(stock, ticker, days=NEWS_DAYS, limit=NEWS_SHOW):
     top.sort(key=lambda n: n["date"], reverse=True)
     return top
 
+# ---------------------------------------------------------------
+# أخبار Benzinga (عبر Google News RSS)
+# ---------------------------------------------------------------
+def get_benzinga_news(stock, ticker, days=7, limit=2):
+    """أخبار Benzinga عن السهم (آخر 7 أيام) عبر Google News RSS"""
+    out = []
+    try:
+        from urllib.parse import quote
+        q = quote(f'"{ticker}" site:benzinga.com when:{days}d')
+        url = f"https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US:en"
+        res = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        if res.status_code != 200:
+            return out
+        company = ""
+        try:
+            company = ((stock.info or {}).get("shortName") or "").lower()
+            company = company.split(",")[0].split(" ")[0] if company else ""
+        except Exception:
+            pass
+        root = ET.fromstring(res.content)
+        now = datetime.now(timezone.utc)
+        for it in root.iter("item"):
+            title = (it.findtext("title") or "").strip()
+            link = (it.findtext("link") or "").strip()
+            pub = it.findtext("pubDate")
+            if not title or not link or not pub:
+                continue
+            has_ticker = re.search(rf"(?<![A-Za-z0-9]){re.escape(ticker)}(?![A-Za-z0-9])", title)
+            if not has_ticker and not (company and company in title.lower()):
+                continue
+            pub_dt = parsedate_to_datetime(pub)
+            if pub_dt.tzinfo is None:
+                pub_dt = pub_dt.replace(tzinfo=timezone.utc)
+            if (now - pub_dt).days > days:
+                continue
+            if title.endswith(" - Benzinga"):
+                title = title[:-len(" - Benzinga")]
+            out.append({"title": title, "url": link, "date": pub_dt.strftime("%Y-%m-%d"), "source": "Benzinga"})
+            if len(out) >= limit:
+                break
+    except Exception as e:
+        print(f"⚠️ Benzinga news خطأ لـ {ticker}: {e}")
+    return out
+
+# ---------------------------------------------------------------
+# دمج المصادر (SEC + Yahoo + Benzinga) بدون تكرار
+# ---------------------------------------------------------------
+_NEWS_KIND_PATTERNS = [
+    ("reverse_split", ("reverse split", "reverse stock split")),
+    ("offering", ("offering", "private placement", "registered direct", "at-the-market")),
+    ("earnings", ("earnings", "results", "guidance", "outlook", "revenue")),
+    ("deal", ("agreement", "contract", "partnership", "acquisition", "acquire", "merger", "award", "deal")),
+    ("management", ("ceo", "cfo", "appoints", "resigns")),
+    ("dividend", ("dividend",)),
+]
+
+_8K_KIND_BY_ITEM = [
+    ("3.03", "reverse_split"), ("5.03", "reverse_split"), ("3.02", "offering"),
+    ("2.02", "earnings"), ("1.01", "deal"), ("5.02", "management"), ("2.03", "debt"),
+]
+
+_KIND_LABEL_AR = {
+    "reverse_split": "تجزئة عكسية", "offering": "طرح/إصدار", "earnings": "نتائج مالية/أرباح",
+    "deal": "اتفاقية جوهرية", "management": "تغيير في الإدارة", "debt": "التزام مالي جديد",
+    "dividend": "توزيعات",
+}
+
+def _news_kind(title):
+    t = title.lower()
+    for kind, keys in _NEWS_KIND_PATTERNS:
+        if any(re.search(rf"\b{re.escape(k)}", t) for k in keys):
+            return kind
+    return None
+
+def _filing_kind(f):
+    form = f["form"]
+    if form == "8-K":
+        for item, kind in _8K_KIND_BY_ITEM:
+            if item in f["items"]:
+                return kind, True
+        return None, False
+    if form in ISSUANCE_FORMS:
+        return "offering", True
+    if form in ("10-Q", "10-K", "20-F"):
+        return "earnings", False
+    return None, False
+
+def _filing_label(f, kind):
+    if kind == "offering" and f["form"] == "8-K":
+        return "بيع أسهم غير مسجل"
+    return _KIND_LABEL_AR.get(kind, SEC_FORMS_AR.get(f["form"], f["form"]))
+
+def _days_apart(d1, d2):
+    try:
+        return abs((datetime.strptime(d1, "%Y-%m-%d") - datetime.strptime(d2, "%Y-%m-%d")).days)
+    except Exception:
+        return 999
+
+def _title_tokens(title):
+    t = re.sub(r"\s[-–|]\s[^-–|]{2,30}$", "", title.lower())
+    return {w for w in re.findall(r"[a-z0-9$%.]+", t) if len(w) > 2}
+
+def _same_story(a, b):
+    ta, tb = _title_tokens(a), _title_tokens(b)
+    if not ta or not tb:
+        return False
+    inter = len(ta & tb)
+    return inter >= 4 and inter / min(len(ta), len(tb)) >= 0.7
+
+def _render_event(ev):
+    text = html.escape((ev["title"] or ev["label"])[:60])
+    links = " · ".join(f'<a href="{u}">{html.escape(n)}</a>' for n, u in ev["links"][:3])
+    return f'• {text} <code>{ev["date"]}</code> — {links}'
+
+def build_alert_sections(stock, ticker, filings, news_items, benzinga_items, sec_limit=4, cat_limit=5):
+    """يدمج SEC + Yahoo + Benzinga: كل حدث يظهر مرة واحدة وتتجمع مصادره في سطر واحد"""
+    events = []
+
+    # 1) الأخبار: نفس القصة من أكثر من مصدر = حدث واحد
+    for n in list(news_items) + list(benzinga_items):
+        src = n.get("source") or "News"
+        if src == "Yahoo Finance":
+            src = "Yahoo"
+        target = next((e for e in events if e["title"] and _same_story(e["title"], n["title"])), None)
+        if target:
+            if src not in [x[0] for x in target["links"]]:
+                target["links"].append((src, n["url"]))
+            continue
+        events.append({"kind": _news_kind(n["title"]), "date": n["date"], "title": n["title"],
+                       "label": "", "links": [(src, n["url"])], "acc": None})
+
+    # 2) الإفصاحات: تُدمج مع خبر من نفس النوع (±3 أيام) وإلا تظهر وحدها مرة لكل نوع
+    seen_alone = set()
+    for f in filings:
+        kind, alone = _filing_kind(f)
+        if not kind:
+            continue
+        target = next((e for e in events if e["kind"] == kind and e["acc"] is None and e["title"]
+                       and _days_apart(e["date"], f["date"]) <= 3), None)
+        if target:
+            target["links"].insert(0, (f["form"], f["url"]))
+            target["acc"] = f["accession"]
+        elif alone and kind not in seen_alone:
+            seen_alone.add(kind)
+            events.append({"kind": kind, "date": f["date"], "title": None, "label": _filing_label(f, kind),
+                           "links": [(f["form"], f["url"])], "acc": f["accession"]})
+
+    # 3) التوزيع على الأقسام
+    div_lines = get_corporate_action_lines(stock, [], [])
+    ordered = sorted(events, key=lambda e: e["date"], reverse=True)
+    if div_lines:
+        ordered = [e for e in ordered if e["kind"] != "dividend"]
+    corp = [e for e in ordered if e["kind"] == "reverse_split"][:2]
+    issuance = [e for e in ordered if e["kind"] == "offering" and e["acc"]][:2]
+    taken = {id(e) for e in corp + issuance}
+    cats = [e for e in ordered if id(e) not in taken][:cat_limit]
+
+    corp_lines = []
+    for e in corp:
+        links = " · ".join(f'<a href="{u}">{html.escape(n)}</a>' for n, u in e["links"][:3])
+        head = f'📉 تجزئة عكسية: {html.escape(e["title"][:55])} ' if e["title"] else "📉 تجزئة عكسية: "
+        corp_lines.append(f'{head}<code>{e["date"]}</code> — {links}')
+
+    # 4) إفصاحات SEC التي لم تظهر أعلاه (نموذج واحد لكل يوم)
+    shown = {e["acc"] for e in corp + issuance + cats if e["acc"]}
+    counts = {}
+    for f in filings:
+        counts[(f["form"], f["date"])] = counts.get((f["form"], f["date"]), 0) + 1
+    sec_lines, seen_keys = [], set()
+    for f in filings:
+        key = (f["form"], f["date"])
+        if f["accession"] in shown or key in seen_keys:
+            continue
+        seen_keys.add(key)
+        line = format_filing_line(f)
+        if counts[key] > 1:
+            line += f" ×{counts[key]}"
+        sec_lines.append(line)
+        if len(sec_lines) >= sec_limit:
+            break
+
+    return {
+        "corp": corp_lines + div_lines,
+        "issuance": [_render_event(e) for e in issuance],
+        "catalysts": [_render_event(e) for e in cats] + get_catalyst_lines(stock, []),
+        "sec": sec_lines,
+    }
+
 def send_telegram(text):
     if not BOT_TOKEN or not CHAT_ID:
         print("❌ Secrets غير معرفة!")
@@ -833,11 +1021,13 @@ def scan_us_market():
                 )
 
                 all_filings = get_sec_filings(ticker, limit=40)
-                filings_display = all_filings[:4]
-                catalyst_lines = get_catalyst_lines(stock, all_filings)
                 news_items = get_recent_news(stock, ticker)
-                issuance_lines = get_issuance_lines(all_filings)
-                corp_action_lines = get_corporate_action_lines(stock, all_filings, news_items)
+                benzinga_items = get_benzinga_news(stock, ticker)
+                sections = build_alert_sections(stock, ticker, all_filings, news_items, benzinga_items)
+                corp_action_lines = sections["corp"]
+                issuance_lines = sections["issuance"]
+                catalyst_lines = sections["catalysts"]
+                sec_lines = sections["sec"]
 
                 # ---- نقاط القوة والمخاطر (عامة لكل سهم) ----
                 strengths, risks = get_strengths_risks(stock, ticker)
@@ -846,7 +1036,7 @@ def scan_us_market():
 
                 print(
                     f"ℹ️ {ticker}: أخبار={len(news_items)} | محفزات={len(catalyst_lines)} "
-                    f"| إصدارات={len(issuance_lines)} | إجراءات={len(corp_action_lines)} | SEC={len(filings_display)}"
+                    f"| إصدارات={len(issuance_lines)} | إجراءات={len(corp_action_lines)} | SEC={len(sec_lines)}"
                 )
 
                 # ---- بناء البطاقة المنظمة ----
@@ -864,23 +1054,14 @@ def scan_us_market():
                 if issuance_lines:
                     extra_parts.append("📋 <b>الإصدارات</b>\n" + "\n".join(issuance_lines[:2]))
 
-                # المحفزات (مترجمة + روابط)
-                cat_lines = []
+                # المحفزات (أخبار + إفصاحات مدمجة بدون تكرار)
                 if catalyst_lines:
-                    cat_lines.extend(catalyst_lines[:3])
-                if news_items:
-                    for n in news_items[:2]:
-                        cat_lines.append(
-                            f'• <a href="{n["url"]}">{html.escape(n["title"][:60])}</a> <code>{n["date"]}</code>'
-                        )
-                if cat_lines:
-                    extra_parts.append("⚡ <b>المحفزات</b>\n" + "\n".join(cat_lines))
+                    extra_parts.append("⚡ <b>المحفزات</b>\n" + "\n".join(catalyst_lines))
                 else:
                     extra_parts.append("⚡ <b>المحفزات</b>\nلا توجد محفزات حديثة")
 
-                # آخر 4 إفصاحات SEC مهمة (مترجمة + روابط)
-                if filings_display:
-                    sec_lines = [format_filing_line(f) for f in filings_display[:4]]
+                # إفصاحات SEC الأخرى (غير المعروضة أعلاه)
+                if sec_lines:
                     extra_parts.append("📄 <b>إفصاحات SEC</b>\n" + "\n".join(sec_lines))
                 else:
                     extra_parts.append("📄 <b>إفصاحات SEC</b>\nلا توجد إفصاحات حديثة")
